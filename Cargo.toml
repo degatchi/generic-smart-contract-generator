@@ -1,5 +1,6 @@
 [package]
-name = "smart-contract-generator"
+name = "generic-smart-contract-generator"
+authors = ["DeGatchi"]
 version = "0.1.0"
 edition = "2021"
 
