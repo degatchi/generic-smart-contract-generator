@@ -30,7 +30,7 @@ impl Contract {
     pub const MSTORE_OP: &'static str = "52";
     pub const SHR_OP: &'static str = "1C";
 
-    pub const APPROVE_SIG: &'static str = "63095ea7b35f52";
+    pub const APPROVE_SIG: &'static str = "095ea7b3";
 
     pub fn default() -> Self {
         Self {
@@ -68,7 +68,6 @@ impl Contract {
         println!("- [00] Old: {}", &self.calldata);
 
         for (i, item) in new_calldata.iter().enumerate() {
-
             self.calldata.extend([*item]);
 
             match self.calldata_offsets.len() == 0 {
@@ -79,69 +78,104 @@ impl Contract {
                 false => self.calldata_offsets.push(self.calldata.len() / 2),
             }
 
-
             // println!("self.calldata_offsets {:?}", &self.calldata_offsets);
             println!("- [{:02x}] New: {}", i + 1, &self.calldata);
         }
     }
 
     pub fn pad_cd_to_mem(&self, cd_from: usize, cd_to: usize) -> String {
-        println!("\n[Unpack Calldata]");
-        let mem_offset = 0;
-        let mut seq = String::new();
-        for (o, offset) in self.calldata_offsets[cd_from..cd_to].iter().enumerate() {
+        println!("\n---\n");
+        println!("[Unpack Calldata]");
 
+        let mut seq = String::new();
+        let mut mem_offset: usize = 4;
+
+        let sig_offset = self.calldata_offsets[cd_from];
+
+        // Load and store sig far left
+        // 0xAABBCCDD 000000000000000000000000000000000000000000000000000000
+        seq.extend([format!(
+            "{}{:02x}{}{}00{}",
+            Self::P1_OP,
+            sig_offset,
+            Self::CD_LOAD_OP,
+            Self::P1_OP,
+            Self::MSTORE_OP,
+        )]);
+
+        for (o, offset) in self.calldata_offsets[cd_from..cd_to]
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
             // edit: realised i did this in the most complex way possible lmao
-            let upper_bound = self.calldata_offsets[o + 1];
-            let word =  self.calldata.split_at(*offset * 2).1.split_at((upper_bound - offset) * 2).0;
-            let padded =  format!("{:0>64}", word);
+            let next_offset = self.calldata_offsets[o + 1];
+            let mut word = self.calldata.split_at(*offset * 2).1;
+            word = word.split_at((next_offset - offset) * 2).0;
+            let padded = format!("{:0>64}", word);
 
             let shr_amt = 64 - word.len();
-
-            println!("[SHR Word: 0x{:02x}]",shr_amt);
-            println!("- [ ] word old: {}", word);
-            println!("- [x] word new: {}", padded);
 
             let calldata_load = format!("{:02x}{}", offset, Self::CD_LOAD_OP);
             let shr = format!("{:02x}{}", shr_amt, Self::SHR_OP);
             let mstore = format!("{:02x}{}", mem_offset, Self::MSTORE_OP);
             let sub_seq = format!("{}{}{}", calldata_load, shr, mstore);
 
-            println!("- [CD -> MEM: {}] {}\n", o, sub_seq);
+            println!("[SHR 0x{:02x} Word {}]", shr_amt, word);
+            println!("- [Calldata To MSTORE: {}] {}", o, sub_seq);
+            println!("- [x] Padded Word {}\n", padded);
+
+            mem_offset += 32;
 
             seq.extend([sub_seq]);
         }
 
-        println!("[CD -> MEM: Sequence] {}", seq);
+        println!("[Calldata To MSTORE: Sequence] {}", seq);
+        println!("\n---");
         seq
     }
 
-    pub fn approve_token(&mut self, token: &str, to: &str, amount: &str, calldata_nibbles: u32) {
+    pub fn approve_token(&mut self, token: &str, to: &str, amount: &str) {
+        let latest_offset = if let Some(x) = self.calldata_offsets.last() {
+            *x
+        } else {
+            0
+        };
 
         // Each nibble = 1 character (pretty convenient right?!)
-        let calldata_len: usize = (to.len() / 2) + (amount.len() / 2);
+        let calldata_len: usize = (Self::APPROVE_SIG.len() + to.len() + amount.len()) / 2;
         let _ = self.update_offset(calldata_len);
-        self.extend_calldata(vec![to, amount]);
-        let cd_to_mem = self.pad_cd_to_mem(0, 2);
-        
-        let calldata_size: String = format!("{:02x}", calldata_nibbles);
+        self.extend_calldata(vec![Self::APPROVE_SIG, to, amount]);
+        let cd_to_mem = self.pad_cd_to_mem(latest_offset, latest_offset + 3);
+
+        let calldata_size: String = format!("{:02x}", calldata_len);
         let ret: String = format!("{}00{}00", Self::P1_OP, Self::P1_OP);
         let arg: String = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}",
             Self::P1_OP,
             calldata_size,
-            cd_to_mem, // we inject the calldata to memory here to make manual reversing cancer to do
             Self::P1_OP,
             self.offset()
         );
         let token: String = format!("{}{}", Self::P20_OP, token); // assuming isnt pass in as '0x...'
         let gas_call_pop: String = format!("{}{}{}", Self::GAS_OP, Self::CALL_OP, Self::POP_OP);
 
-        let seq = format!("{}{}{}{}", ret, arg, token, gas_call_pop);
+        let seq = format!(
+            "{}{}{}{}{}",
+            // we inject the "calldata to memory" anywhere to make manual
+            // reversing cancer to do, but here makes it clearer rn
+            cd_to_mem,
+            ret,
+            arg,
+            token,
+            gas_call_pop
+        );
 
+        let source_b = self.source.clone();
+        self.source.extend([seq]);
         println!(
-            "\n[Generated] Token Approval -> For Token {}\n{}",
-            token, seq
+            "\n[Extending Source] Token Approval\n- [ ] Old {}\n- [ ] New {}\n",
+            source_b, &self.source
         );
     }
 }
@@ -164,7 +198,8 @@ mod test {
             "C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
             "9FC3da866e7DF3a1c57adE1a97c9f00a70f010c8",
             "3635C9ADC5DEA00000",
-            0,
         );
+
+        println!("\n[Calldata]\n{}", contract.calldata);
     }
 }
